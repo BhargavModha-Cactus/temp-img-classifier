@@ -1,20 +1,21 @@
 from __future__ import annotations
-import json, warnings
+import contextlib, json, time, warnings
 from pathlib import Path
 
 import altair as alt
+import numpy as np
 import pandas as pd
 import streamlit as st
 import torch, torch.nn as nn, torch.nn.functional as F
 from PIL import Image
 from torchvision import models, transforms
-import contextlib
 
 st.set_page_config(page_title="DocFigure Classifier", layout="centered")
 
 CKPT_PATH = Path("best_ckpt.pth")
 IDX2LBL_PATH = Path("idx2label.json")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+TOP_K = 5  # number of predictions to display
 
 FALLBACK_CLASSES = [
     "Line graph", "Natural image", "Table", "3D object", "Bar plot", "Scatter plot",
@@ -90,22 +91,55 @@ def transform():
     ])
 
 
-def predict(mdl: nn.Module, img: Image.Image, idx2lbl: dict[int, str]):
+try:
+    import psutil;
+
+    _PROC = psutil.Process()
+except ImportError:
+    psutil = None;
+    _PROC = None
+
+
+def predict_analytics(mdl: nn.Module, img: Image.Image):
+    """Return probs, idx, analytics_dict."""
     x = transform()(img).unsqueeze(0).to(DEVICE)
 
-    #  autocast only on CUDA; otherwise do nothing  ──────────────────────────
+    # CPU/GPU memory baseline
+    start_mem = _PROC.memory_info().rss if _PROC else None
+    if DEVICE == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.empty_cache()
+
+    # timed inference
     amp_ctx = torch.amp.autocast(device_type="cuda") if DEVICE == "cuda" \
         else contextlib.nullcontext()
-
+    t0 = time.perf_counter()
     with amp_ctx, torch.inference_mode():
-        logits = mdl(x)  # may be fp16 (CUDA) or fp32/bf16 (CPU)
-    probs = F.softmax(logits.float(), 1)[0].cpu().numpy()  # ← cast to fp32
-    return probs, int(probs.argmax())
+        logits = mdl(x)
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+
+    # softmax (ensure fp32)
+    probs = F.softmax(logits.float(), 1)[0].cpu().numpy()
+    pred_idx = int(probs.argmax())
+
+    # memory after
+    cpu_mem_mb = None
+    if _PROC:
+        cpu_mem_mb = (_PROC.memory_info().rss - start_mem) / (1024 ** 2)
+    gpu_mem_mb = None
+    if DEVICE == "cuda":
+        gpu_mem_mb = torch.cuda.max_memory_allocated() / (1024 ** 2)
+
+    analytics = {
+        "elapsed_ms": round(elapsed_ms, 2),
+        "cpu_mem_mb": None if cpu_mem_mb is None else round(cpu_mem_mb, 2),
+        "gpu_mem_mb": None if gpu_mem_mb is None else round(gpu_mem_mb, 2),
+        "img_w": img.width,
+        "img_h": img.height,
+    }
+    return probs, pred_idx, analytics
 
 
-# -----------------------------------------------------------------------------
-# UI
-# -----------------------------------------------------------------------------
 st.title("📊 DocFigure Classifier")
 
 idx2lbl = load_idx2label()
@@ -120,26 +154,38 @@ if img_file:
     st.image(img, caption="Uploaded image", use_container_width=True)
 
     with st.spinner("Running inference…"):
-        probs, pred_idx = predict(model, img, idx2lbl)
-        subclass = idx2lbl[pred_idx]
-        complexity = lbl2cplx[subclass]
+        probs, pred_idx, stats = predict_analytics(model, img)
 
+    subclass = idx2lbl[pred_idx]
+    complexity = lbl2cplx[subclass]
+
+    # ── results panel ────────────────────────────────────────────────────────
     st.success(f"### {subclass}\n**Complexity:** {complexity}")
 
-    k = 5
-    topk_idx = probs.argsort()[-k:][::-1]
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Latency (ms)", stats["elapsed_ms"])
+    col2.metric("Resolution", f'{stats["img_w"]}×{stats["img_h"]}')
+    mem_txt = ("–" if stats["gpu_mem_mb"] is None else
+               f'{stats["gpu_mem_mb"]:.1f} MB GPU') if DEVICE == "cuda" else \
+        ("–" if stats["cpu_mem_mb"] is None else
+         f'{stats["cpu_mem_mb"]:.1f} MB CPU')
+    col3.metric("Extra memory", mem_txt)
+
+    # ── top‑k bar chart ──────────────────────────────────────────────────────
+    topk_idx = probs.argsort()[-TOP_K:][::-1]
     df = pd.DataFrame({
         "label": [idx2lbl[i] for i in topk_idx],
         "probability": probs[topk_idx]
     })
     st.altair_chart(
         alt.Chart(df).mark_bar().encode(
-            x=alt.X("probability:Q", title="Probability", scale=alt.Scale(domain=[0, 1])),
+            x=alt.X("probability:Q", title="Probability",
+                    scale=alt.Scale(domain=[0, 1])),
             y=alt.Y("label:N", sort="-x", title="")
-        ).properties(width=500),
-        use_container_width=True
+        ).properties(width=500), use_container_width=True
     )
 
+    # raw confidences
     with st.expander("Raw confidences JSON"):
         st.json({idx2lbl[i]: float(p) for i, p in enumerate(probs)})
 
